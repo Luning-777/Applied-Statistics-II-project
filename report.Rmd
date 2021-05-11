@@ -1,0 +1,746 @@
+---
+title: "Final Project Report"
+author: "Luning Li"
+date: "2021/4/15"
+output: 
+  pdf_document:
+    number_sections: true
+abstract: "This paper focuses on the people aged 25-35 working for wages in Ohio in 2018, and shows that the gender gap exists even taken account in factors such as usual weekly working hours, occupation income scores, race, age and education level. This paper indicates that females are paid only 86.6% (84.3%,89.0%) of their male counterparts, conditioned on the independent variables mentioned."
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+
+# Introduction
+
+With the development of the feminist movement in the past decade, more and more women choose to enter the workplace. However, the gender pay gap has attracted wide attention. In 2017, women working full time and year-round in the United States typically were paid just 80 percent of what men were paid, a gap of 20 percent (Fontenot et al., 2018). The cause of gender pay gap is controversal. This kind of dispute mainly focuses on whether this gap is due to gender discrimination, or to the difference objective factors between male and female. The purpose of this project is to first investigate to what extend gender factor can affect the wage, and then provide women with advice to get a high-paying job by establishing a regression model on wage income. It may take another decade for women to get equal pay for equal job as men; however, they could contribute more to other independent variables of wage to get themselves a higher wage.
+
+Focusing on people at the age of 25-35 in Ohio, who are not self-employed and worked 52 weeks in 2018, this paper tries to find the subjective factors that influence wage. Bayesian hierarchy model is introduced on county level means of wages in Ohio. The advantage of a hierarchy model is that it provides a flexible way to explain the county level means. The results from hierarchy model pulls the estimates of county level means towards the population mean and therefore, less sensitive to noises compared to no pooling method. 
+
+
+# Data
+
+The data set used in this research is the American Community Survey 2019 Sample extracted from IPUMS USA (www.ipums.org). It involves the following variables:
+
+- `AGE`: Age of the respondents. Filter the young respondents (control the age to 25-35).
+- `SEX`: Sex of the respondents. 1 if male, 2 if female.
+- `WKSWORK1`: The number of weeks that respondents worked last year. Filter respondents with `WKSWORK1`$>40$.
+- `UHRWORK1`: The number of hours per week that the respondent usually worked, if the person worked during the previous year. Filter respondents with `UHRWORK1`$>0$.
+- `INCWAGE`: The total pre-tax wage and salary income - that is, money received as an employee - for the previous year with $999999 = \text{N/A}$ and $999998 = \text{Missing}$. Filter respondents with `INCWAGE`$>0$. 
+- `OCCSCORE`: A constructed variable that assigns occupational income scores to each occupation.
+- `PWSTATE2`: The state in which the respondent's primary workplace was located. Filter the respondents working in Ohio (code 39).
+- `PWCOUNTY`: The county (or county equivalent) where the respondent worked. $0$ if not available.
+- `RACWHT`:  A bivariate indicator of "White" race.
+- `CLASSWKR`: Class of worker. $1$ stands for self-employed and $2$ stands for working for wages.
+- `RACE`: The race of the respondents.
+
+The dependent variable that we are interested in is the average weekly salary (on log scale) that one respondents received last year. That is:
+
+- $Y = \log\left(\frac{\text{INCWAGE}}{\text{WKSWORK1}}\right).$
+
+The relevant independent variables are:
+
+- `SEX`: gender of the respondents;
+- `OCCSCORE`: occupational income score;
+- `UHRSWORK`: usual hours worked per week;
+- `education`: education level of the respondents;
+- `age`: if the age of respondent is 30 years or older;
+- `RACWHT`: if the race of the respondent is white or not.
+
+In addition, a hierarchical structure will be applied on the county level mean. i.e. assume that the county level means of the weekly salary are independent samples coming from the same distribution.
+
+## Data Preprocessing:
+
+When extracting the data from IPUMS, choose the case where age of respondents is between 25 and 35, and the primary working State to be Ohio. Then preprocess the data for further analysis:
+
+- Select the respondents who worked in Ohio (this is done when downloading data from the IPUMS website).
+- Select the respondents whose age is between 25-35 (this is done when downloading data from IPUMS website).
+- Select the respondents whose worked at least 40 weeks last year (`WKSWORK`$>40$).
+- Select the respondents whose average hours worked per week (`UHRSWORK`) is greater than $0$.
+- Select the respondents whose wage and salary income (`INCWAGE`) is greater than $0$.
+- Select the respondents whose occupational income score (`OCCSCORE`) is greater than $0$.
+- Select the respondents who is working for wages but not self-employed.
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(pander)
+library(rstan)
+library(loo)
+library(bayesplot) 
+library(gridExtra) # arrange plot
+library(tidybayes)
+library(fdrtool) # half normal distribution
+library(ggpubr) # arrange multiple ggplots
+```
+
+```{r}
+# read the data
+df <- read.csv("research1.csv")
+
+# data selection as indicated above
+df1 <- df %>%
+  filter(WKSWORK1 == 52) %>%
+  filter(UHRSWORK > 0) %>%
+  filter(INCWAGE > 0) %>%
+  filter(OCCSCORE > 0) %>%
+  filter(CLASSWKR == 2)
+```
+
+After checking, missing values exist for variable `PWCOUNTY`. Those respondents worked in county not identifiable from public-use data was removed from our research. We only focused on the employees working within an identifiable county.
+
+```{r}
+# delete the respondents who worked in non-identifiable county
+df1 <- df1 %>% filter(PWCOUNTY > 0)
+```
+
+Then we need to modify some variables as following:
+
+* Calculate the dependent variable `Y` by $Y = \log\left(\frac{\text{INCWAGE}}{\text{WKSWORK1}}\right).$
+
+* Construct a categorical variable `education`:
+  + 0 if the respondent does not obtain high school diploma,
+  + 1 if the respondent has a high school diploma, but does not have a bachelor degree,
+  + 2 if the highest degree of the respondent is a Bachelor's degree,
+  + 3 if the highest degree of the respondent is a Master's degree or higher.
+  
+* Construct a categorical variable `age` to indicate whether the respondent is elder than 30 years old.
+  
+* construct a categorical variable `County` to record the county code for further Bayesian analysis.
+
+After the data processing, our original data looks like:
+
+```{r}
+df_fit <- df1 %>%
+  mutate(gender = ifelse(SEX == 1, "Male", "Female")) %>%
+  mutate(Y = log(INCWAGE / WKSWORK1)) %>%
+  mutate(education = ifelse(EDUCD <= 61,0,ifelse(EDUCD <= 81, 1, ifelse(EDUCD == 101,2, 3))))%>%
+  mutate(age = ifelse(AGE < 30,0,1), age1 = ifelse(AGE < 30, "less than 30","greater than or equal to 30"))%>%
+  mutate(racwht = ifelse(RACWHT == 2,"white","not white"))%>%
+  dplyr::select(Y, SEX, gender, UHRSWORK, OCCSCORE, PWCOUNTY,education,RACWHT,racwht,age,age1,RACE,AGE)
+
+PWCOUNTY <- unique(df_fit$PWCOUNTY)
+clabel <- data.frame(PWCOUNTY,1:length(PWCOUNTY))
+colnames(clabel) <- c("PWCOUNTY","COUNTY")
+
+df_fit <- merge(df_fit, clabel, by = "PWCOUNTY")
+
+pander(head(df_fit))
+```
+
+But if we look at the scatter plot of our dependent variable `Y`, we can find that there are some ourliers. For our analysis, I would like to remove those outliers from our data.
+
+```{r fig1,fig.height=3,fig.width=5}
+d5 <- df_fit %>% filter(Y <= 3.5 | Y >= 8.7)
+df_fit <- df_fit %>% filter(Y > 3.5 & Y < 8.7)
+ggplot(data = d5,aes(x = Y, y = Y,color="outlier")) + 
+  geom_point() + 
+  geom_point(data = df_fit,aes(x = Y, y = Y, color = "main"))
+```
+
+
+
+
+## Exploratory Data Analysis
+
+Before fitting the model, the following plots can be applied to investigate the correlations between our dependent variable $Y$ and the corresponding independent variables.
+
+```{r fig2,fig.height=3,fig.width=5}
+g1<- df_fit %>%
+  ggplot(aes(x = Y, fill = gender)) +
+  geom_density(color="#e9ecef", alpha=0.4, position = 'identity') +
+  scale_fill_manual(values=c("#69b3a2", "#404080")) +
+  labs(fill="")+
+  xlim(3,10)+
+  ggtitle("Density of Log Wage Income per Week by gender")+
+  xlab("Log Wage Income per Week")
+
+g1
+```
+
+The density plot of log weekly wage income (`Y`) illustrates the gender pay gap exists in Ohio. This density from female is more left-tailed than that from male, and therefore, females are generally paid less than the males. Therefore, this research will treat `gender` as a predictor for wage. 
+
+```{r fig3,fig.height=3,fig.width=5}
+g2 <- ggplot(data = df_fit, 
+             aes(x = OCCSCORE, y = Y, color = gender, shape = gender))+
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE)+
+  ggtitle("Log Wage Income per Week Versus Occupation Score")+
+  ylab("Log Wage income per Week")+
+  xlab("Occupation Score")
+g2
+```
+
+The scatter plot of `Y` against the occupation score (`OCCSCORE`) shows a positive correlation. Therefore, `OCCSCORE` is taken as a predictor for the wage. Moreover, the solid lines represent the linear regression lines between those two variables from each gender. The two regression lines are close to each other, so no interaction term between `OCCSCORE` and `gender` is considered in the model.
+
+```{r fig4,fig.height=3,fig.width=5}
+g3 <- ggplot(data = df_fit, 
+             aes(x = UHRSWORK, y = Y, color = gender, shape = gender))+
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE)+
+  ggtitle("Log Wage Income per Week Versus Usual Hours Worked per Week")+
+  ylab("Log Wage income per Week")+
+  xlab("Usual Hours Worked per Week")
+g3
+```
+
+The scatter plot of `Y` against the usual hours worked per week (`UHRSWORK`) shows a positive correlation. Therefore, `UHRSWORK` is taken as a predictor for the wage. Again, the solid lines represent the linear regression lines between those two variables from each gender. The two regression lines are close to each other, so no interaction term between `UHRSWORK` and `gender` is considered in the model.
+
+```{r fig5,fig.height=3,fig.width=5}
+d2 <- df_fit %>% group_by(COUNTY) %>%
+  summarise(mean = mean(Y))
+
+
+g4 <- ggplot(data = df_fit)+
+  geom_point(aes(x = jitter(COUNTY), y = Y, color = gender))+
+  geom_point(data =d2, aes(x = COUNTY, y = mean, color = "mean"), size = 3)+
+  ggtitle("Log Wage Income per Week Versus County")+
+  xlab("jittered County")+
+  ylab("Log Wage income per Week")
+
+g4
+```
+
+The county means of observed `Y` are distributed around 6.5. It is reasonable to assume that these means come from the same distribution. This justifies our hierarchical structure on county level mean of `Y`. Note that in this plot, the County code is jittered to make the observations from each county more visible.
+
+```{r fig6,fig.height=3,fig.width=5}
+d3 <- df_fit %>%
+  group_by(gender,education) %>%
+  summarise(mean = mean(Y))%>%
+  filter(gender == "Female")
+
+d4 <- df_fit %>%
+  group_by(gender,education) %>%
+  summarise(mean = mean(Y))%>%
+  filter(gender == "Male")
+  
+df_fit %>% 
+  ggplot(aes(x = as.character(education),y = Y,fill = gender)) + 
+  geom_boxplot()+
+  geom_point(data = d3, 
+             aes(x = as.character(education), y = mean, color = "female mean" ),
+             size =2)+
+  geom_point(data = d4, 
+             aes(x = as.character(education), y = mean, color = "male mean" ),
+             size =2)+
+  ggtitle("Log Weekly Wage against Education Level")+
+  xlab("Education Level")+
+  ylab("Log Weekly Wage")
+```
+
+In this education plot, the 4 education levels means:
+
+- 0: does not have a high school diploma
+- 1: have a high school diploma but does not have a Bachelor's degree
+- 2: Bachelor's degree
+- 3: Master degree or higher
+
+we can see a linear relationship between the education and weekly wage. Moreover, the boxplot shows a linear relationship between education level and log weekly wage. An interesting observation is that when the level of education is raised by one level, the increase in log weekly wages is almost constant. Therefore, we might treat this variable as a continuous variable in our model.
+
+
+```{r fig7,fig.height=3,fig.width=5}
+df_fit %>% 
+  ggplot(aes(x = racwht,y = Y,fill = gender))+geom_boxplot()+
+  ggtitle("Log Weekly Wage V.S. Race")+
+  xlab("Race") + 
+  ylab("Log Weekly Wage")
+```
+
+Differences in weekly log wage income exists between white and non-white races. Therefore, the `RACWHT` variable is taken as an independent variable in our model (This will be expressed by a dummy variable). This difference is almost the same within across gender; therefore, no iteration term between age and race is introduced in our model.
+
+The plot of dependent variable $Y$ against age group is similar to the plot above, so I move it to the appendix.
+
+# Methods
+
+In this report, I use multiple linear regression through Bayesian method, with the log weekly income as the response variable, and the possible influential factors as predictor variables. Moreover, a hierarchy structure is introduced to model the county mean of weekly income wage.
+
+Mathematically, the model can be written as:
+
+\begin{eqnarray*}
+y_{i} | \eta_{c[i]}^{\text {county }} & \sim N\left(\beta_{0}+\eta_{c[i]}^{\text {country }}+\sum_{j=1}^6\beta_{j} x_{i,j}, \sigma_{y}^{2}\right) \\
+\eta_{c}^{\text {country }} & \sim N\left(0,\left(\sigma_{\eta}^{\text {country }}\right)^{2}\right), \text { for } c=1,2, \ldots, C.
+\end{eqnarray*}
+
+where 
+
+* $y_i$ the log weekly income of the ith respondents
+* $x_{i,1}$ gender of the ith respondents
+  + 0: the respondent is male
+  + 1: the respondent is female
+* $x_{i,2}$ the education level of the ith respondents (treated as a continuous variable)
+  + 0: does not have a high school diploma
+  + 1: have a high school diploma but does not have a Bachelor's degree
+  + 2: Bachelor's degree
+  + 3: Master degree or higher
+* $x_{i,3}$ race of the ith respondents is white or not
+  + 0: the respondent is not white
+  + 1: the respondent is white
+* $x_{i,4}$ indicator that the ith respondents is 30 years old or older
+  + 0: the respondent is younger than 30
+  + 1: the respondent is older than 30 (include 30)
+* $x_{i,5}$ the usual weekly work hours of the ith respondent
+* $x_{i,6}$ the occupation income score, reflecting the median of the income of this occupation
+* $\eta_{c[i]}^{\text {county }}$ the county level derivation of log weekly wage income in the county where the ith respondent worked.
+
+Note that the continuous independent variables except the `education` are standardized to make the Bayesian model converges faster.
+
+The reason for choosing this model is: by the density plot from the EDA part, the distribution of dependent variable $Y$ (log weekly wage income) is approximately normal. And we see a linear relationship between the independent variables and $Y$ in EDA. Therefore, a multiple linear regression is a natural choice. The hierarchy structure is introduced, because slight difference exist in county mean. But the sample size within some county is small. Under this case, hierarchy model is more effective than estimating the mean within each county independently. People from the same county may have similarity in the income structure; therefore, it is more appropriate to use hierarchical model on county means instead of taking the population mean for all counties.
+
+In order to apply the Bayesian method, we have to set the priors for all parameters in this model:
+
+- $\beta_0,\beta_1,\dots,\beta_6\sim N(0,1)$,
+- $\eta_c^{\text {county }}\sim N(0,1)$,
+- $\sigma_y, \sigma_{\eta}^{\text {country }}\sim N_+(0,1)$.
+
+Then the model is fitted using the `RStan` package, and it uses MCMC sampling. 
+
+```{r results=FALSE}
+stan_data <- list(C = length(PWCOUNTY),
+                   N = nrow(df_fit), 
+                   y = df_fit$Y,
+                   county = df_fit$COUNTY,
+                   racwht = df_fit$RACWHT-1,
+                   gender = df_fit$SEX - 1,
+                   age = df_fit$age,
+                   education = df_fit$education,
+                   uhrswork = (df_fit$UHRSWORK-mean(df_fit$UHRSWORK))/sd(df_fit$UHRSWORK),
+                   occscore = (df_fit$OCCSCORE- mean(df_fit$OCCSCORE)) / sd(df_fit$OCCSCORE)
+                   )
+model <- stan(data = stan_data,
+               file = "model.stan",
+               seed = 2201)
+```
+
+
+# Results
+
+## Estimated Coefficients
+
+Using the mean as the estimated coefficients, and using the equi-tailed $95\%$ credible interval, we have:
+
+```{r}
+fit <- summary(model)
+fit_sum <- fit$summary
+fit_sum1 <- fit_sum[1:7,c(1,4,8)]
+ci <- paste("(", round(fit_sum1[,2], digits = 3), ",", 
+            round(fit_sum1[,3],digits = 3),")")
+coeff <- data.frame(fit_sum1[,1],ci)
+colnames(coeff) <- c("estimated coefficients","95% CI")
+pander(coeff)
+```
+
+Interpretation of the coefficients:
+
+* $\beta_0$: Estimated population mean of log weekly wage income of male, non-white respondents with average usual weekly working hours, average occupation scores and without high school diploma.
+* $\beta_1$: When the other independent variables are exactly the same, the weekly wage income of female is $\exp(-0.1435) = 0.866$ ($0.843,0.890$) times of that of non-white people.
+* $\beta_2$: If the respondent's education increased by one level, then his/her weekly wage income is expected to increase by $\exp(0.2679)=1.307$ ($1.284,1.331$).
+* $\beta_3$: When the other independent variables are exactly the same, the weekly income of white people is $\exp(0.250) = 1.284$ ($1.184,1.275$) times of that of non-white people.
+* $\beta_4$: When the other independent variables are exactly the same, the weekly income of people older than $30$ is $\exp(0.1551) = 1.168$ ($1.138,1.198$) times of that of people younger than $30$.
+* $\beta_5$: When the usual worked hours is increased by one standard derivation from the average, the weekly wage income is expected to increase by $\exp(0.2108) = 1.235$ ($1.218,1.251$).
+* $\beta_6$: An interesting observation is that the influence of occupation income score on weekly income is not as large as one might expect. Occupation income score is determined by the median of the income for this occupation. With other factors fixed, choosing an occupation that has $1$ standard derivation income score higher than the average, the weekly wage income will increase by  $\exp(0.08835) = 1.092$ ($1.077,1.108$). 
+
+
+This illustrate that despite the influence of education, race, age, weekly working hours as well as the occupation income score, the gender pay gap still exists. Moreover, seeking an occupation that has high median pay does not contribute to the income as much as one might expect. Trying to get a higher education degree will help to increase the weekly wage income a lot.
+
+The more detailed information about posterior distribution of coefficients, and the prior v.s. posterior density plots of all parameters are in the Appendix.
+
+More specifically, we can look at the posterior estimated mean of log weekly income non-white people of different gender but with average weekly working hours, average occupation income score, with a Bachelor's degree and of the same age group working in County Hamilton. We can see a significant pay gender gap.
+
+```{r fig11,fig.height=2,fig.width=4}
+# posterior estimates plot
+gg1 <- model %>% 
+  spread_draws(beta0,beta1,beta2,sigma_y,eta_c[c]) %>%
+  pivot_wider(names_from = c, values_from = eta_c,names_prefix = "eta_c")%>%
+  mutate(male = beta0 + eta_c1+beta2*3,
+         female = beta0 + beta1 +beta2*3+eta_c1) %>%
+  pivot_longer(male:female,names_to = "Gender",values_to = "estimated_log_weekly_wage") %>%
+  ggplot(aes(y = Gender, x = estimated_log_weekly_wage)) +
+  stat_halfeye() +
+  ggtitle("Posterior Estimates of Log Weekly Wage of people under 30 by gender")
+gg1
+```
+
+The same trend will be see for the white race group, and the elder age group, since the model used does not contain an iterative term between `age`, `race`, and `gender`.
+
+The posterior estimated mean of log weekly income non-white females with average weekly working hours, average occupation income score,and of the same age group working in County Hamilton indicates a significant pay gap in different education level.
+
+```{r fig15,fig.height=2,fig.width=4}
+# posterior estimates plot
+gg1 <- model %>% 
+  spread_draws(beta0,beta1,beta2,sigma_y,eta_c[c]) %>%
+  pivot_wider(names_from = c, values_from = eta_c,names_prefix = "eta_c")%>%
+  mutate(nhs = beta0 + beta1+ eta_c1,
+         hs = beta0 + beta1+ eta_c1+beta2*1,
+         bachelor = beta0 + beta1+ eta_c1+beta2*2,
+         master = beta0 + beta1 +beta2*3+eta_c1) %>%
+  pivot_longer(nhs:master,names_to = "education",values_to = "estimated_log_weekly_wage") %>%
+  ggplot(aes(y = education, x = estimated_log_weekly_wage)) +
+  stat_halfeye() +
+  ggtitle("Posterior Estimates of Log Weekly Wage",subtitle = "female aged under 30")
+gg1
+```
+
+The similar plot in education level indicates that 
+
+## Diagnostics
+
+We have to first check that the samples converges well. It can be checked through the trace plots and the density plots of four chains for all parameters:
+
+```{r fig8,fig.height=3,fig.width=5}
+traceplot(model,pars=c("beta0","beta1","beta2","beta3","beta4","beta5","beta6","sigma_y","sigma_c"))
+```
+
+The trace plots of parameters are given as above. We can see that the four chains are well mixed, which indicates that our model converges well. 
+
+```{r fig9,fig.height=3,fig.width=5}
+pars <- c("beta0","beta1","beta2","beta3","beta4","beta5","beta6","sigma_y","sigma_c")
+stan_dens(model,separate_chains = TRUE, pars = pars)
+```
+
+The trace plots together with the density plots above show that the sampling from the `Stan` model converges and the four chains are mixed well. This means that the model converges to a target distribution as we expected.
+
+In addition, the target posterior distribution of all coefficients can be checked through the paired joint density:
+
+```{r}
+# paired joint distributions
+pars <- c("beta0","beta1","beta2","beta3","beta4","beta5","beta6")
+pairs(model,pars = pars,main = "Posterior Joint Distribution of Parameters")
+```
+
+
+From the plot above, we can see that the paired posterior joint distributions of all coefficients are reasonable, since the scatter plot above is cloud-like as we expected. 
+
+## Compare Models
+
+An alternative model:
+
+Introduce hierarchical structures on County level, age level and race level.
+
+\begin{eqnarray*}
+y_{i} | \eta_{c[i]}^{\text {county }} & \sim N\left(\beta_{0}+\eta_{c[i]}^{\text {country }}+\sum_{j=1}^4\beta_{j} x_{i,j}, \sigma_{y}^{2}\right) \\
+\eta_{c}^{\text {country }} & \sim N\left(0,\left(\sigma_{\eta}^{\text {country }}\right)^{2}\right), \text { for } c=1,2, \ldots, C.\\
+\eta_{a}^{\text {age}} & \sim N\left(0,\left(\sigma_{\eta}^{\text {age }}\right)^{2}\right), \text { for } a=1,2, \ldots, A.\\
+\eta_{r}^{\text {race }} & \sim N\left(0,\left(\sigma_{\eta}^{\text {race }}\right)^{2}\right), \text { for } r=1,2, \ldots, R.
+\end{eqnarray*}
+
+where 
+
+* $y_i$ the log weekly income of the ith respondents
+* $x_{i,1}$ gender of the ith respondents
+  + 0: the respondent is male
+  + 1: the respondent is female
+* $x_{i,2}$ the education level of the ith respondents (treated as a continuous variable)
+  + 0: does not have a high school diploma
+  + 1: have a high school diploma but does not have a Bachelor's degree
+  + 2: Bachelor's degree
+  + 3: Master degree or higher
+* $x_{i,3}$ the usual weekly work hours of the ith respondent
+* $x_{i,4}$ the occupation income score, reflecting the median of the income of this occupation
+* $\eta_{c[i]}^{\text {county }}$ the county level derivation of log weekly wage income
+* $\eta_{a[i]}^{\text {age}}$ the age level derivation of log weekly wage income
+* $\eta_{r[i]}^{\text {race }}$ the race level derivation mean of log weekly wage income
+
+Set the priors for all parameters in this model:
+
+- $\beta_0,\beta_1,\dots,\beta_6\sim N(0,1)$,
+- $\eta_c^{\text {county }},\eta_a^{\text {age}},\eta_r^{\text {race }}\sim N(0,1)$,
+- $\sigma_y, \sigma_{\eta}^{\text {country }},\sigma_{\eta}^{\text {age}},\sigma_{\eta}^{\text {gender }}\sim N_+(0,1)$.
+
+
+```{r results = FALSE}
+stan_data2 <- list(C = length(PWCOUNTY),
+                  A = 11,
+                  R = 9,
+                   N = nrow(df_fit), 
+                   y = df_fit$Y,
+                   county = df_fit$COUNTY,
+                   age = df_fit$AGE-24,
+                   race = df_fit$RACE,
+                   gender = df_fit$SEX - 1,
+                   education = df_fit$education,
+                   uhrswork = (df_fit$UHRSWORK-mean(df_fit$UHRSWORK))/sd(df_fit$UHRSWORK),
+                   occscore = (df_fit$OCCSCORE- mean(df_fit$OCCSCORE)) / sd(df_fit$OCCSCORE)
+                   )
+model2 <- stan(data = stan_data2,
+               file = "model2.stan",
+               seed = 2201)
+```
+
+```{r}
+loglik2 <- rstan::extract(model2)[["log_lik"]]
+loo2 <- loo(loglik2, save_psis = TRUE)
+```
+
+
+One way to compare the fitness of the two models is to compare the replicated predicted density of independent variable to its observed density. The predicted density and observed density of our dependent variable $Y$ (log weekly wage income) are given as below:
+
+```{r fig10,fig.height=2,fig.width=3.5}
+# observed vs predicted plot
+set.seed(2201)
+y <- df_fit$Y
+yrep <- rstan::extract(model)[["y_rep"]]
+yrep2 <- rstan::extract(model2)[["y_rep"]]
+```
+```{r}
+samp100 <- sample(nrow(yrep), 100)
+ppc_dens_overlay(y, yrep[samp100, ])  + ggtitle("Model 1: Observed versus predicted Y ")
+ppc_dens_overlay(y, yrep2[samp100, ])  + ggtitle("Model 2: Observed versus predicted Y ")
+```
+
+This compares our dataset with 100 replicates from our model.  The trend of the replicated predicted densities from two models are similar and both are slightly different from the observed density of $Y$: the observed density has higher mode, and some fluctuations.
+
+
+Moreover we can introduce test statistic $T$:
+
+\begin{eqnarray*}
+T = \text{proportion of people with weekly income less than 1000 dollars}
+\end{eqnarray*}
+
+The density of test statistic $T$ by gender groups:
+
+```{r fig12,fig.height=2,fig.width=3.5}
+stats1 <- function(y){
+  sum(y <= log(1000))
+}
+
+ppc_stat_grouped(y, yrep, group = df_fit$gender, stat = stats1)
+ppc_stat_grouped(y, yrep2, group = df_fit$gender, stat = stats1)
+```
+
+The density of test statistic $T$ by age groups:
+
+```{r fig13,fig.height=2,fig.width=3.5}
+ppc_stat_grouped(df_fit$Y, yrep, group = df_fit$age1, stat = stats1)
+ppc_stat_grouped(df_fit$Y, yrep2, group = df_fit$age1, stat = stats1)
+```
+
+The plot on the left is from Model 1 and the plot on the right is from Model 2. By the test statistic, both models seem to be fine. We cannot make statement about which model work better through this test statistic.
+
+The Leave-one-out expected log pointwise predictive density can be used to compare the fitness of two models. But the table below still does not give enough information of which model works better.
+
+```{r}
+# compare to the uniform distribution
+loglik <- rstan::extract(model)[["log_lik"]]
+loglik2 <- rstan::extract(model2)[["log_lik"]]
+loo <- loo(loglik, save_psis = TRUE)
+loo2 <- loo(loglik2, save_psis = TRUE)
+
+result <- loo_compare(loo,loo2)
+pander(result)
+```
+
+
+Another way is to use leave-one-out probability integral transform (PIT). In order to get a sense of how well the model fits the data, one can compare the PIT to standard uniform distribution:
+
+```{r fig19,fig.height=2,fig.width=3.5}
+ppc_loo_pit_overlay(yrep = yrep, y = y, lw = weights(loo$psis_object))
+ppc_loo_pit_overlay(yrep = yrep2, y = y, lw = weights(loo2$psis_object))
+```
+
+The PIT curves from two models are similar. The PIT curve fluctuates around the standard uniform distributions. From the diagnostic test above, we can see that our model works fine for fitting the data. However, more independent variables should be added into the model to improve the fitness. See more details in discussion part. (The summary of leave-one out expected pointwise log density is in the appendix.)
+
+In fact, we cannot determine which model fits the dataset better. However, the fitting process of Model 2 is much more time-consuming compared to Model 1. This is the reason that we choose Model 1 over Model 2.
+
+
+
+# Discussion
+
+From the Results part, we can see that given the same education level, the same race, the same age group, the same usual weekly work hours and the same occupation income score, gender is still a strong influential factor contributing to the weekly wage income. Women are paid $86.6/%$ ($84.3\%,89.0\%$) of the men, taking into account the education level, the hours worked per week, the occupation income score, race and age.
+
+The result also indicates that the occupation one chooses and the education one receives also influence the weekly wage income. However, the occupation income score does not have as large impact as one might expect. Choosing an occupation with 1 standard derivation higher only result in $1.092$ ($1.077,1.108$) increase in weekly wage income. It is more effective to try to pursue a higher degree, than to choose an occupation that has high median pay, in order to get a higher wage.
+
+However, I am not satisfied with this model. The following independent variables can be introduced to make the model works better:
+
+- the proficiency of the respondents in terms of his/her occupation,
+- the time when the respondents started to take his/her current job,
+- the rank of university that the respondents graduated from.
+
+However, the IPUMS does not provide any variables described above.
+
+Another interesting question is: do personality traits factors influence the income.Jordan B. Peterson states that the gender pay gap is not caused by gender discrimination; an important factor is the gender personality traits difference. (Jordan 2018). This brings a widely spread discussion. I wonder to what extent the personality treats will contribute to weekly income and if we include the personality traits variable in our model, then after controlling all the other independent variables, is gender still a statistically significant influential contributor to weekly wage income. Unfortunately, the personality traits are not provided in IPUMS. So I could not include it in this model.
+
+Further analysis can also be down by applying a principal component analysis (PCA) before fitting the models. Since this model only contains 6 independent variables, I did not apply PCA. But if in future, the variables described above can be collected and added into the model, a PCA should be down to get better result.
+
+\newpage
+
+# Reference {-}
+
+Fontenot, K., Semega, J., & Kollar, M. (2018). Income and Poverty in the United States: 2017. Washington: U.S. Census Bureau.
+
+Jordan B. Peterson. (2018). 12 Rules for Life: An Antidote to Chaos. Random House Canada
+
+Steven Ruggles, Sarah Flood, Sophia Foster, Ronald Goeken, Jose Pacas, Megan Schouweiler and Matthew Sobek. IPUMS USA: Version 11.0 [dataset]. Minneapolis, MN: IPUMS, 2021. https://doi.org/10.18128/D010.V11.0
+
+\newpage
+
+# Appendix {-}
+
+The log weekly wage income against the age group:
+
+```{r fig17,fig.height=3,fig.width=5}
+df_fit %>% 
+  ggplot(aes(x = age1,y = Y,fill = gender))+geom_boxplot()+
+  ggtitle("Log Weekly Wage V.S. Age Group")+
+  xlab("Age Group") + 
+  ylab("Log Weekly Wage")
+```
+
+The summary of statistics for coefficients in the model:
+
+```{r}
+fit <- summary(model)
+fit_sum <- fit$summary
+fit_sum <- fit_sum[c(1:7,29,30),c(1,3,4,6,8,9,10)]
+pander(fit_sum)
+```
+The prior and posterior density plots of parameters in this model:
+
+```{r fig20,fig.height=6,fig.width=6}
+# draw samples of coefficients from the model
+dsamples <- model %>% gather_draws(beta0,beta1,beta2,beta3,beta4,beta5,beta6,sigma_y,sigma_c)
+
+# plot the prior and posterior distributions:
+g1 <- dsamples %>%
+  filter(.variable == "beta0") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-2,6))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta0")
+
+g4 <- dsamples %>%
+  filter(.variable == "beta1") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta1")
+
+g5 <- dsamples %>%
+  filter(.variable == "beta2") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta2")
+
+g6 <- dsamples %>%
+  filter(.variable == "beta3") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta3")
+
+g7 <- dsamples %>%
+  filter(.variable == "beta4") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta4")
+
+g8 <- dsamples %>%
+  filter(.variable == "beta5") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta5")
+
+g9 <- dsamples %>%
+  filter(.variable == "beta6") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-1,1))+
+  stat_function(fun = dnorm,
+                args = list(mean = 0,
+                            sd = 1),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("beta6")
+
+g2 <- dsamples %>%
+  filter(.variable == "sigma_y") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-0.1,0.6))+
+  stat_function(fun = dhalfnorm,
+                args = list(sd2theta(1)),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("sigma_y")
+
+g3 <- dsamples %>%
+  filter(.variable == "sigma_c") %>%
+  ggplot(aes(.value, color = "posterior"))+
+  geom_density(size = 1)+
+  xlim(c(-0.1,0.4))+
+  stat_function(fun = dhalfnorm,
+                args = list(sd2theta(1)),
+                aes(colour = "prior"), size = 1)+
+  scale_color_manual(name = "", values = c("prior" = "pink", "posterior"= "skyblue"))+
+  xlab("sigma_c")
+
+
+figure <- ggarrange(g1,g4,g5,g6,g7,g8,g9, g2, g3,
+                    ncol = 2, nrow = 5)
+figure
+```
+
+The Leave-one-out expected log pointwise predictive density of this model: 
+
+```{r}
+pander(loo$estimates)
+pander(loo2$estimates)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

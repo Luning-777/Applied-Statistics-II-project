@@ -1,0 +1,79 @@
+---
+title: "Research Proposal"
+author: "Luning Li"
+date: "2021/3/29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(pander)
+```
+
+```{r}
+# read the data
+df <- read.csv("research1.csv")
+
+# data selection as indicated above
+df1 <- df %>%
+  filter(WKSWORK1 == 52) %>%
+  filter(UHRSWORK > 0) %>%
+  filter(INCWAGE > 0) %>%
+  filter(OCCSCORE >0)
+```
+
+```{r}
+# delete the respondents who worked in non-identifiable county
+df1 <- df1 %>% filter(PWCOUNTY > 0)
+```
+
+
+```{r}
+df2 <- df1 %>%
+  mutate(gender = ifelse(SEX == 1, "Male", "Female")) %>%
+  mutate(Y = log(INCWAGE / WKSWORK1)) %>%
+  mutate(education = ifelse(EDUCD <= 61,0,ifelse(EDUCD <= 81, 1, ifelse(EDUCD == 101,2, ifelse(EDUCD>=116,4,3)))))%>%
+  mutate(race = ifelse(RACE ==1,"white",ifelse(RACE == 2, "black",ifelse(RACE>= 4 & RACE <= 6,"asian","other"))))%>%
+  filter(CLASSWKR == 2) %>%
+  mutate(age = ifelse(AGE >=30,1,0))%>%
+  mutate(child = ifelse(NCHILD > 1,1,0)) 
+
+PWCOUNTY <- unique(df2$PWCOUNTY)
+clabel <- data.frame(PWCOUNTY,1:length(PWCOUNTY))
+colnames(clabel) <- c("PWCOUNTY","COUNTY")
+
+df2 <- merge(df2, clabel, by = "PWCOUNTY")
+
+pander(head(df2))
+```
+
+```{r}
+d5 <- df2 %>% filter(Y <= 3.5 | Y >= 8.7)
+df2 <- df2 %>% filter(Y > 3.5 & Y < 8.7)
+ggplot(data = d5,aes(x = Y, y = Y,color="outlier")) + 
+  geom_point() + 
+  geom_point(data = df2,aes(x = Y, y = Y, color = "main"))
+```
+
+```{r}
+fit <- lm(Y ~  gender + UHRSWORK + OCCSCORE + RACWHT + as.factor(education) + NCHILD + AGE,data = df2)
+summary(fit)
+```
+
+
+
+
+
+
+
+# Reference
+
+Fontenot, K., Semega, J., & Kollar, M. (2018). Income and Poverty in the United States: 2017. Washington: U.S. Census Bureau.
+
+Steven Ruggles, Sarah Flood, Sophia Foster, Ronald Goeken, Jose Pacas, Megan Schouweiler and Matthew Sobek. IPUMS USA: Version 11.0 [dataset]. Minneapolis, MN: IPUMS, 2021. https://doi.org/10.18128/D010.V11.0
+
